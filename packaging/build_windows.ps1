@@ -68,6 +68,53 @@ Write-Host "==> [1/3] PyInstaller: bundling openworker-server ($Triple)" -Foregr
     (Join-Path $Here "openworker-server.spec")
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed (exit $LASTEXITCODE)" }
 
+# Smoke test: does the frozen server actually START? PyInstaller happily produces a
+# binary that dies on its first import — e.g. a bundled dependency dropping a module
+# across a major version bump — and every artifact-level check still passes, because
+# the artifact is fine; the program is not. PyInstaller does warn ("Failed to collect
+# submodules … ImportError"), but that scrolls past in a wall of build noise, so this
+# asserts on behaviour instead of asking anyone to read the log.
+Write-Host "==> [1.5/3] smoke-testing the frozen server" -ForegroundColor Cyan
+$SmokeExe   = Join-Path $Here "dist\openworker-server\openworker-server.exe"
+$SmokeState = Join-Path ([IO.Path]::GetTempPath()) ("ocw-smoke-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $SmokeState | Out-Null
+$SmokePort = 8799
+$SmokeOut  = Join-Path $SmokeState "out.log"
+$SmokeErr  = Join-Path $SmokeState "err.log"
+# State dir via the process env: the child inherits it at spawn, and the variable is
+# removed straight after so nothing later in this script (npm, tauri) sees it.
+$env:COWORKER_STATE_DIR = $SmokeState
+try {
+    $Smoke = Start-Process -FilePath $SmokeExe `
+        -ArgumentList "--host", "127.0.0.1", "--port", "$SmokePort" `
+        -RedirectStandardOutput $SmokeOut -RedirectStandardError $SmokeErr `
+        -NoNewWindow -PassThru
+} finally {
+    Remove-Item Env:\COWORKER_STATE_DIR -ErrorAction SilentlyContinue
+}
+$SmokeOk = $false
+for ($Try = 0; $Try -lt 40; $Try++) {
+    Start-Sleep -Seconds 1
+    if ($Smoke.HasExited) { break }   # died — stop waiting, report below
+    try {
+        # /v1/health is the designated tokenless endpoint (app.py `tokenless_paths`) —
+        # liveness without the sidecar token the Tauri shell would normally inject.
+        Invoke-WebRequest -Uri "http://127.0.0.1:$SmokePort/v1/health" `
+            -UseBasicParsing -TimeoutSec 2 | Out-Null
+        $SmokeOk = $true
+        break
+    } catch { }
+}
+if (-not $Smoke.HasExited) { Stop-Process -Id $Smoke.Id -Force -ErrorAction SilentlyContinue }
+if (-not $SmokeOk) {
+    Write-Host "ERROR: the frozen server does not start — refusing to build an app with a dead backend." -ForegroundColor Red
+    Write-Host "--- last 20 lines of its output ---"
+    Get-Content $SmokeOut, $SmokeErr -ErrorAction SilentlyContinue | Select-Object -Last 20
+    throw "frozen-server smoke test failed"
+}
+Remove-Item -Recurse -Force $SmokeState -ErrorAction SilentlyContinue
+Write-Host "    server starts and answers /v1/health"
+
 Write-Host "==> [2/3] staging sidecar resources" -ForegroundColor Cyan
 # Onedir bundle (exe + _internal\) ships via Tauri `resources`, landing at <install>\sidecar\
 # next to the app exe — onefile's per-launch self-extraction cost seconds of boot splash.
